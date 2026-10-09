@@ -1,95 +1,106 @@
-# Zpng
+# ZLpng
 
-Lossless image compression with a C API and command-line tools. The current
-encoder combines reversible image filters with Zstd and offers **compression
-effort 1–8** to trade encoding time for smaller files. It supports one to four
-channels and 8-bit or 16-bit samples, preserving every sample including alpha
-and hidden color values.
+Lossless image compression built around [OpenZL](https://openzl.org/), with
+simple reversible image filters and **compression effort 1–8**. ZLpng
+supports one to four channels and 8-bit or 16-bit samples, preserving every
+sample bit, including alpha and hidden color values.
 
-**Effort 1 is the default:** an optimized implementation that produces exactly
-the same files as original ZPNG. Higher levels try more filters from a fixed,
-format-specific list and keep the smallest result. Decoding runs only the
-stored method and needs no effort setting. Increasing effort cannot increase
-an image's compressed size, and every level is bounded by original ZPNG size.
+**Effort 1 is the fast default:** vectorized left/color filtering followed
+by OpenZL native LZ. Higher efforts try complementary filters and OpenZL
+numeric graphs from a fixed list for each sample format, then keep the
+smallest complete file. The decoder runs only the stored method. Increasing
+effort cannot increase compressed size.
 
-On the corpus below, level 1 encodes at **736 MiB/s versus 657 MiB/s** for
-original ZPNG. Level 6 saves **13.04% of total bytes**; level 8 saves **13.73%**.
+ZLpng has its own `ZLP1` format and C API. The original
+[Zpng](https://github.com/catid/Zpng) remains a separate historical project.
+ZLpng files are not compatible with its decoder.
 
-<!-- ROUND5_PERFORMANCE_START -->
-## Performance at every effort level
+<!-- ZLPNG_PERFORMANCE_START -->
+## Compression performance
 
-The current encoder was measured on **324 images / 852.58 MiB** of exact sample data: 205 Development, 83 Evaluation A, and 36 Evaluation B images. Development shaped the policy; evaluation images were previously used. Results describe this corpus.
+On 324 images, effort 1 encodes at **814 MiB/s** and decodes at **1611 MiB/s** (1.28× and 1.37× original ZPNG). Its files are 0.76% larger in total. Effort 8 saves **13.77%** of the original codec's stored bytes.
 
-![Current compression savings and processing time at every effort level](experiments/round5/results/readme_effort_performance.svg)
+![ZLpng compression, encode time and decode time by effort](experiments/round6/results/zlpng_analysis/readme_performance.svg)
 
-**Compression performance.** Positive savings mean smaller files than original ZPNG. The mean columns use the geometric mean of each image’s compressed-size ratio to original ZPNG, giving every image equal weight. “All bytes” uses summed file sizes; raw/stored is the whole corpus compression ratio (higher is better).
+The corpus contains 852.58 MiB of raw samples. Per-image geometric mean savings versus original ZPNG; higher is better. Total-byte savings weight images by compressed size. Raw/stored is the ratio of total raw bytes to complete compressed bytes.
 
-| Effort | Development mean saving | Evaluation A mean saving | Evaluation B mean saving | All 324 mean saving | All bytes saved | Raw / stored |
+| Effort | Development (205) | Evaluation A (83) | Evaluation B (36) | All (324) | Total-byte saving | Raw/stored |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Original ZPNG | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 2.113× |
-| **1 (default)** | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% | 2.113× |
-| 2 | 33.06% | 5.85% | 17.85% | 25.27% | 5.83% | 2.244× |
-| 3 | 37.87% | 10.88% | 35.83% | 31.61% | 9.35% | 2.331× |
-| 4 | 41.51% | 16.14% | 36.59% | 35.28% | 10.20% | 2.353× |
-| 5 | 43.13% | 16.77% | 37.14% | 36.60% | 10.34% | 2.357× |
-| 6 | 44.63% | 19.23% | 39.03% | 38.35% | 13.04% | 2.430× |
-| 7 | 45.36% | 19.60% | 39.15% | 38.95% | 13.13% | 2.432× |
-| 8 | 45.77% | 19.84% | 40.75% | 39.46% | 13.73% | 2.449× |
+| 1 | -17.35% | -5.60% | -20.71% | -14.58% | -0.76% | 2.097× |
+| 2 | 29.18% | 4.63% | 20.32% | 22.56% | 8.20% | 2.301× |
+| 3 | 34.42% | 10.93% | 28.54% | 28.39% | 8.62% | 2.312× |
+| 4 | 37.70% | 15.97% | 32.51% | 32.13% | 9.99% | 2.347× |
+| 5 | 39.49% | 15.97% | 33.15% | 33.45% | 10.21% | 2.353× |
+| 6 | 41.50% | 18.45% | 39.48% | 36.06% | 13.67% | 2.447× |
+| 7 | 42.21% | 18.72% | 39.61% | 36.62% | 13.75% | 2.450× |
+| 8 | 42.69% | 19.67% | 39.61% | 37.15% | 13.77% | 2.450× |
 
-**Processing time.** One pinned logical CPU on a Threadripper PRO 9985WX, bundled Zstd level 1, one warmup and three measured repetitions. Each image contributes its median API time; totals sum those medians and means divide by 324. Times include attempted encodings, allocations and output copies, and exclude file I/O. They estimate the cost of processing the corpus once at that level, not the duration of the full repeated benchmark.
+Complete API processing time across all 324 images:
 
-| Effort | Encode total (s) | Decode total (s) | Mean encode (ms/image) | Mean decode (ms/image) | Encode (MiB/s) | Decode (MiB/s) |
+| Effort | Encode ms/image | Decode ms/image | Encode MiB/s | Decode MiB/s | Total encode s | Total decode s |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Original ZPNG | 1.297 | 0.714 | 4.00 | 2.20 | 657.25 | 1194.18 |
-| **1 (default)** | 1.158 | 0.724 | 3.57 | 2.23 | 736.41 | 1177.97 |
-| 2 | 3.957 | 1.372 | 12.21 | 4.23 | 215.44 | 621.39 |
-| 3 | 6.456 | 1.471 | 19.92 | 4.54 | 132.07 | 579.40 |
-| 4 | 8.802 | 1.589 | 27.17 | 4.90 | 96.86 | 536.58 |
-| 5 | 12.746 | 1.556 | 39.34 | 4.80 | 66.89 | 547.80 |
-| 6 | 15.839 | 1.954 | 48.89 | 6.03 | 53.83 | 436.38 |
-| 7 | 19.967 | 2.127 | 61.63 | 6.56 | 42.70 | 400.91 |
-| 8 | 25.787 | 2.334 | 79.59 | 7.20 | 33.06 | 365.23 |
+| Original ZPNG | 4.145 | 2.231 | 634.9 | 1179.4 | 1.343 | 0.723 |
+| 1 | 3.234 | 1.634 | 813.7 | 1610.8 | 1.048 | 0.529 |
+| 2 | 13.147 | 5.415 | 200.2 | 485.9 | 4.260 | 1.755 |
+| 3 | 25.931 | 5.153 | 101.5 | 510.7 | 8.402 | 1.669 |
+| 4 | 33.422 | 5.529 | 78.7 | 475.9 | 10.829 | 1.791 |
+| 5 | 42.677 | 5.424 | 61.7 | 485.1 | 13.827 | 1.757 |
+| 6 | 49.631 | 6.375 | 53.0 | 412.8 | 16.080 | 2.066 |
+| 7 | 62.076 | 6.720 | 42.4 | 391.6 | 20.113 | 2.177 |
+| 8 | 78.603 | 6.772 | 33.5 | 388.6 | 25.467 | 2.194 |
 
-Effort 1 produces identical files to original ZPNG with an optimized encoder. Effort k tries the first k ordered methods, capped by the format’s list length, and keeps the smallest complete stream. Every prefix includes legacy, so increasing effort cannot increase file size and no image exceeds original ZPNG size. Different winning filters can change decoder speed.
+Measured on an AMD Ryzen Threadripper PRO 9985WX, one pinned logical CPU, with a native-optimized release build. Each image uses the median of three complete API calls after one warmup; totals sum those medians. Filtering, all attempted candidates, allocations, framing and inverse transforms are included; file I/O is excluded. Every repetition reconstructs the exact input.
 
-[Exact metrics (CSV)](experiments/round5/results/readme_metrics.csv) · [Formulas and provenance](experiments/round5/results/readme_metrics.json)
-<!-- ROUND5_PERFORMANCE_END -->
+The corpus blends photographs, graphics/text, synthetic patterns, and scientific/specialized images, including alpha and 16-bit samples. Development selected the lists; both evaluation sets were used in earlier experiments. These are descriptive corpus results, not a fresh holdout.
+
+[Detailed measurements](experiments/round6/results/zlpng_analysis/readme_metrics.csv) · [Verification record](experiments/round6/results/zlpng_analysis/provenance.json)
+
+<!-- ZLPNG_PERFORMANCE_END -->
 
 ## Build and use
 
-The effort-based encoder is built with the optional experiment targets:
+Requires CMake 3.20.2+, a C11/C++17 compiler, and a 64-bit platform. CMake fetches
+the pinned OpenZL 0.3.0 source and its dependencies into the build directory.
 
 ```sh
-cmake -S . -B experiments/build-r5 -DCMAKE_BUILD_TYPE=Release \
-  -DZPNG_BUILD_EXPERIMENTS=ON
-cmake --build experiments/build-r5 --target zpng_effort -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 
-experiments/build-r5/zpng_effort compress input.zraw output.zpf --effort 4
-experiments/build-r5/zpng_effort decompress output.zpf restored.zraw
+build/zlpng compress input.zraw output.zlp --effort 4
+build/zlpng decompress output.zlp restored.zraw
 ```
 
-Omit `--effort` to use level 1. The CLI reads `.zraw` files containing exact
-sample data; [format details and API examples](experiments/round4/README.md)
-are in the encoder documentation. Applications can link `zpng_effortlib` and
-call `ZPNG_CompressWithEffort` and `ZPNG_DecompressWithFilters`.
+Omit `--effort` to use 1. The CLI uses `.zraw` files containing exact sample
+data; see the [format and API guide](docs/FORMAT.md). Applications can link
+`ZLpng::ZLpng` (or `zlpnglib`) and call `ZLPNG_Compress`, `ZLPNG_Decompress`,
+and `ZLPNG_Free`. The image API accepts padded input rows and returns packed
+rows.
 
-The output identifies its own filter and parameters. Use the expanded
-decoder for these streams; the original `ZPNG_Decompress` supports original
-ZPNG streams only.
+For maximum speed on the machine doing the build, configure with
+`-DZLPNG_NATIVE=ON`. Leave it off when distributing binaries to other CPUs.
+The current build and benchmark validation is on Linux x86-64.
 
-## How it works
+## Filters and effort
 
-The encoder applies a reversible prediction, color transform, or sample
-packing method before Zstd compression. Each sample format has an ordered
-list beginning with the fast ZPNG filter, followed by complementary filters
-chosen on development images with equal weight per image domain. Effort k
-tries the first k entries, capped by the list's length. The stored result includes all metadata
-needed to invert the winning transform exactly.
+Each format begins with the fast left/color transform using OpenZL LZ level
+1 and a 64 KiB window. Complementary entries include gradient and MED
+predictors, green subtraction, planar layouts, reversible sample packing,
+run handling, and local predictor blends. Some 16-bit entries use OpenZL's
+numeric graph to retain sample structure through compression.
 
-See the [encoder documentation](experiments/round4/README.md),
-[ordered filter list](experiments/round5/results/selection/policy.csv), and
-[benchmark metrics](experiments/round5/results/readme_metrics.csv).
+The [ordered lists](experiments/round6/results/zlpng_selection/policy.csv)
+were selected using only the 205 development images. Greedy selection gives
+each image domain equal weight, allows one backend per transform, and caps
+lists at eight entries. Formats with fewer useful development candidates
+stop earlier. These are measured choices within the tested candidate pool,
+not a claim that every possible OpenZL graph has been explored.
+
+See the [benchmark methodology](experiments/round6/PLAN.md) and
+[selection record](experiments/round6/results/zlpng_selection/policy.json).
+Downloaded images and codec dependencies are kept out of git.
 
 ## Credits
 
 Software by Christopher A. Taylor — mrcatid@gmail.com.
+OpenZL is developed by Meta and its contributors.

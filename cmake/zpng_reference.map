@@ -1,0 +1,4 @@
+{
+  global: ZPNG_Compress; ZPNG_Decompress; ZPNG_Free;
+  local: *;
+};

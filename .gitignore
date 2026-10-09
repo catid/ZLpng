@@ -33,3 +33,5 @@
 
 # Local experiment dependencies
 .venv-experiments/
+/build/
+/build-*/

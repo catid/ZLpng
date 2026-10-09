@@ -22,17 +22,17 @@ typedef struct ZLPNG_ImageData {
 extern "C" {
 #endif
 
-/* Losslessly compress an image, trying the first min(effort, pool size)
- * methods and retaining the smallest complete stream. Effort must be 1..8.
- * Input has 1..4 channels, 1 or 2 bytes per channel, dimensions 1..65535,
- * and little-endian 16-bit samples. StrideBytes may include row padding;
+/* Losslessly compress with median edge prediction and OpenZL. Effort 1..8
+ * controls backend work; 1 is fastest. Higher effort may increase file size.
+ * Input: 1..4 channels, 1 or 2 bytes per channel, dimensions 1..65535,
+ * little-endian 16-bit samples. StrideBytes may include row padding;
  * Buffer.Bytes must cover the last packed row. Failure returns {NULL, 0}.
- * Release successful output with ZLPNG_Free(). */
+ * Release successful output with ZLPNG_Free(). Calls are thread-safe. */
 ZLPNG_Buffer ZLPNG_Compress(const ZLPNG_ImageData* image, unsigned effort);
 
-/* Decode a self-contained ZLP1 stream. Encoder policy and effort are not
+/* Decode a self-contained ZLP2 stream. Encoder effort is not
  * needed. Output rows are packed. Failure returns an all-zero image.
- * This API does not decode original ZPNG or experimental ZPF streams.
+ * This API does not decode original ZPNG or earlier ZLP1 streams.
  * The default maximum raw image size is UINT_MAX. For files from untrusted
  * sources, use ZLPNG_DecompressWithLimit with an application-specific limit. */
 ZLPNG_ImageData ZLPNG_Decompress(ZLPNG_Buffer encoded);
@@ -41,6 +41,11 @@ ZLPNG_ImageData ZLPNG_Decompress(ZLPNG_Buffer encoded);
  * pixel storage. This limits returned image size, not total decoder scratch
  * memory. A zero limit rejects all images. */
 ZLPNG_ImageData ZLPNG_DecompressWithLimit(ZLPNG_Buffer encoded, unsigned max_raw_bytes);
+
+/* Explicit worker limit: 0 = automatic (up to 8), 1 = single thread.
+ * The regular API uses 0. Thread count does not affect compressed bytes. */
+ZLPNG_Buffer ZLPNG_CompressThreads(const ZLPNG_ImageData* image, unsigned effort, unsigned threads);
+ZLPNG_ImageData ZLPNG_DecompressThreadsWithLimit(ZLPNG_Buffer encoded, unsigned max_raw_bytes, unsigned threads);
 
 /* Release library-owned storage and reset the buffer to {NULL, 0}. */
 void ZLPNG_Free(ZLPNG_Buffer* buffer);

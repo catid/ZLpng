@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="265" viewBox="0 0 1000 265" role="img" aria-labelledby="title desc">
+<title id="title">Median edge prediction and parallel compression</title>
+<desc id="desc">Predict pixel X using its left, upper, and upper-left neighbors. Subtract the prediction, separate channels, and compress independent horizontal bands with OpenZL.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#64748b"/></marker></defs>
+<rect width="1000" height="265" rx="14" fill="#f8fafc"/>
+<g font-family="system-ui, sans-serif" fill="#0f172a">
+<text x="28" y="35" font-size="19" font-weight="700">Predict from three neighbors</text>
+<g stroke="#cbd5e1" stroke-width="2">
+<rect x="50" y="58" width="66" height="57" rx="5" fill="#e2e8f0"/>
+<rect x="121" y="58" width="66" height="57" rx="5" fill="#e2e8f0"/>
+<rect x="50" y="120" width="66" height="57" rx="5" fill="#e2e8f0"/>
+<rect x="121" y="120" width="66" height="57" rx="5" fill="#ccfbf1" stroke="#0d9488"/>
+</g>
+<g font-size="22" text-anchor="middle"><text x="83" y="95">UL</text><text x="154" y="95">U</text><text x="83" y="157">L</text><text x="154" y="157" font-weight="700">X</text></g>
+<text x="28" y="210" font-size="16">P = median(L, U, L + U − UL)</text>
+<text x="28" y="236" font-size="14" fill="#475569">Store X − P; restore by adding P.</text>
+<path d="M330 135H381" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+<text x="393" y="35" font-size="19" font-weight="700">Each band runs independently</text>
+<g fill="#fff" stroke="#cbd5e1" stroke-width="2">
+<rect x="393" y="85" width="160" height="95" rx="9"/>
+<rect x="594" y="85" width="160" height="95" rx="9"/>
+<rect x="795" y="85" width="170" height="95" rx="9" fill="#e0f2fe" stroke="#0284c7"/>
+</g>
+<g text-anchor="middle" font-size="17"><text x="473" y="118" font-weight="700">Color transform</text><text x="473" y="147" font-size="15">G, R−G, B−G</text><text x="473" y="167" font-size="13" fill="#475569">8-bit RGB(A)</text>
+<text x="674" y="118" font-weight="700">MED residuals</text><text x="674" y="149" font-size="15">Planar channels</text>
+<text x="880" y="118" font-weight="700">OpenZL</text><text x="880" y="149" font-size="15">One frame per band</text></g>
+<g stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"><path d="M558 135H584"/><path d="M759 135H785"/></g>
+<text x="393" y="218" font-size="15" fill="#475569">SIMD within bands · multiple threads across bands</text>
+<text x="393" y="241" font-size="14" fill="#475569">Decoding reverses each step, preserving every sample bit.</text>
+</g></svg>

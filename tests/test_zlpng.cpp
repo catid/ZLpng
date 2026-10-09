@@ -26,8 +26,8 @@ void reject(Bytes& bytes) {
 }
 void verify(const ZLPNG_Buffer& encoded, const Bytes& raw, unsigned width, unsigned height,
             unsigned channels, unsigned bytes) {
-    check(encoded.Data && encoded.Bytes > 16 && !std::memcmp(encoded.Data, "ZLP1", 4), "Wrong native stream");
-    check(encoded.Data[4] == 1 || encoded.Data[4] == 2, "Non-OpenZL backend emitted");
+    check(encoded.Data && encoded.Bytes > 12 && !std::memcmp(encoded.Data, "ZLP2", 4), "Wrong native stream");
+    check(encoded.Data[10] == 1 || encoded.Data[10] == 2, "Non-OpenZL backend emitted");
     ImageOwner restored; restored.value = ZLPNG_Decompress(encoded);
     const auto& image = restored.value;
     check(image.Buffer.Data && image.Buffer.Bytes == raw.size() && image.WidthPixels == width &&
@@ -36,21 +36,17 @@ void verify(const ZLPNG_Buffer& encoded, const Bytes& raw, unsigned width, unsig
           "Complete image roundtrip mismatch");
     ++roundtrips;
 }
-void put32(unsigned char* p, unsigned n) {
-    for (unsigned i = 0; i < 4; ++i) p[i] = static_cast<unsigned char>(n >> (8 * i));
-}
 Bytes numeric_frame(unsigned element, unsigned header_element) {
     const unsigned short samples[] = {0x1234, 0xabcd, 0x0102, 0xff00};
-    const size_t size = sizeof(samples), offset = 32;
+    const size_t size = sizeof(samples), offset = 16;
     Bytes encoded(offset + zlpng_backend_bound(2, size));
-    std::memcpy(encoded.data(), "ZLP1", 4); encoded[4] = 2;
-    encoded[5] = static_cast<unsigned char>(header_element); encoded[6] = 24;
-    std::memcpy(encoded.data() + 8, "ZPF1", 4);
-    put32(encoded.data() + 12, unsigned(size / header_element));
-    put32(encoded.data() + 16, 1); encoded[20] = 1; encoded[21] = header_element * 8;
+    std::memcpy(encoded.data(), "ZLP2", 4);
+    encoded[4] = size / header_element; encoded[6] = 1;
+    encoded[8] = 1; encoded[9] = header_element; encoded[10] = 2;
     const size_t result = zlpng_backend_compress(2, 1, 0, element, samples, size,
                                                 encoded.data() + offset, encoded.size() - offset);
     check(result != 0, "Cannot create numeric fixture");
+    for (unsigned i = 0; i < 4; ++i) encoded[12 + i] = static_cast<unsigned char>(result >> (8 * i));
     encoded.resize(offset + result);
     return encoded;
 }
@@ -75,12 +71,9 @@ int main() {
                     std::memcpy(padded.data() + size_t(y) * stride, raw.data() + size_t(y) * row, row);
                 ZLPNG_ImageData strided = source;
                 strided.Buffer = view(padded); strided.StrideBytes = stride;
-                unsigned previous = UINT_MAX;
                 for (unsigned effort = 1; effort <= 8; ++effort) {
                     BufferOwner encoded; encoded.value = ZLPNG_Compress(&source, effort);
                     verify(encoded.value, raw, width, height, channels, bytes);
-                    check(encoded.value.Bytes <= previous, "Effort compressed size increased");
-                    previous = encoded.value.Bytes;
                     BufferOwner padded_encoded; padded_encoded.value = ZLPNG_Compress(&strided, effort);
                     verify(padded_encoded.value, raw, width, height, channels, bytes);
                     check(padded_encoded.value.Bytes == encoded.value.Bytes &&
@@ -105,6 +98,29 @@ int main() {
                 check(!short_input.value.Data, "Short source buffer accepted"); ++rejected;
             }
 
+        // Cross-band SIMD/stride boundaries, independent callers, and deterministic threading.
+        for (unsigned channels = 1; channels <= 4; ++channels) for (unsigned bytes : {1u, 2u}) {
+            const unsigned width = 1031, height = 513, row = width * channels * bytes;
+            Bytes raw(size_t(row) * height);
+            for (size_t i = 0; i < raw.size(); ++i) raw[i] = static_cast<unsigned char>(random());
+            ZLPNG_ImageData source = {view(raw), bytes, channels, width, height, row};
+            for (unsigned effort : {1u, 3u, 8u}) {
+                BufferOwner serial; serial.value = ZLPNG_CompressThreads(&source, effort, 1);
+                verify(serial.value, raw, width, height, channels, bytes);
+                for (unsigned threads : {2u, 8u, 64u, UINT_MAX}) {
+                    BufferOwner parallel; parallel.value = ZLPNG_CompressThreads(&source, effort, threads);
+                    check(parallel.value.Data && parallel.value.Bytes == serial.value.Bytes &&
+                          !std::memcmp(parallel.value.Data, serial.value.Data, serial.value.Bytes),
+                          "Thread count changed encoded bytes");
+                    ImageOwner restored;
+                    restored.value = ZLPNG_DecompressThreadsWithLimit(parallel.value, unsigned(raw.size()), threads);
+                    check(restored.value.Buffer.Data && restored.value.Buffer.Bytes == raw.size() &&
+                          !std::memcmp(restored.value.Buffer.Data, raw.data(), raw.size()), "Parallel roundtrip failed");
+                    ++roundtrips; ++parity_checks;
+                }
+            }
+        }
+
         Bytes raw(63 * 7 * 3, 0x35);
         ZLPNG_ImageData source = {view(raw), 1, 3, 63, 7, 63 * 3};
         BufferOwner encoded; encoded.value = ZLPNG_Compress(&source, 1);
@@ -114,8 +130,8 @@ int main() {
             Bytes truncated(good.begin(), good.begin() + length); reject(truncated);
         }
         for (const auto& mutation : std::vector<std::pair<size_t, unsigned char>>{
-                 {0, 'X'}, {3, '9'}, {4, 0}, {4, 3}, {5, 2}, {5, 0}, {6, 0}, {6, 7},
-                 {7, 1}, {8, 0}, {10, 0}, {12, 0}, {14, 0}, {14, 5}, {15, 0}, {15, 3}}) {
+                 {0, 'X'}, {3, '1'}, {4, 0}, {6, 0}, {8, 0}, {8, 5},
+                 {9, 0}, {9, 3}, {10, 0}, {10, 3}, {11, 1}, {12, 0xff}, {15, 0xff}}) {
             Bytes corrupt = good; corrupt[mutation.first] = mutation.second; reject(corrupt);
         }
         Bytes trailing = good; trailing.push_back(0); reject(trailing);
@@ -126,10 +142,24 @@ int main() {
             check(image.value.Buffer.Data && image.value.Buffer.Bytes == 8, "Valid numeric fixture rejected");
             ++roundtrips;
             Bytes wrong_width = numeric_frame(width, 3 - width); reject(wrong_width);
-            Bytes wrong_codec = numeric; wrong_codec[4] = 1; wrong_codec[5] = 1; reject(wrong_codec);
+            Bytes wrong_codec = numeric; wrong_codec[10] = 1; reject(wrong_codec);
             Bytes numeric_trailing = numeric; numeric_trailing.push_back(0); reject(numeric_trailing);
-            Bytes reserved = numeric; reserved[30] = 1; reject(reserved);
+            Bytes reserved = numeric; reserved[11] = 1; reject(reserved);
         }
+        // A bad later band must fail cleanly after other workers have started.
+        Bytes large(1027 * 1101 * 3, 0x39);
+        ZLPNG_ImageData multi = {view(large), 1, 3, 1027, 1101, 1027 * 3};
+        BufferOwner bands; bands.value = ZLPNG_CompressThreads(&multi, 1, 8);
+        check(bands.value.Data != nullptr, "Band fixture failed");
+        Bytes damaged(bands.value.Data, bands.value.Data + bands.value.Bytes);
+        size_t second = 16;
+        for (unsigned i = 0; i < 4; ++i) second += size_t(damaged[12 + i]) << (8 * i);
+        check(second + 8 < damaged.size(), "Missing second band");
+        damaged[second + 4] ^= 0xff;
+        ImageOwner failure;
+        failure.value = ZLPNG_DecompressThreadsWithLimit(view(damaged), unsigned(large.size()), 8);
+        check(!failure.value.Buffer.Data, "Corrupt later band accepted"); ++rejected;
+
         ZLPNG_Free(nullptr);
         ZLPNG_Buffer empty = {}; ZLPNG_Free(&empty); ZLPNG_Free(&empty);
         check(!empty.Data && !empty.Bytes, "Empty free failed");

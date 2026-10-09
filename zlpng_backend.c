@@ -95,12 +95,6 @@ size_t zlpng_backend_compress(int codec, int level, int window_log,
     ZLPNG_CONFIG(ZL_CParam_contentChecksum, ZL_TernaryParam_disable);
 #undef ZLPNG_CONFIG
     ZL_GraphID graph = codec == ZLPNG_OPENZL_NUMERIC ? ZL_GRAPH_NUMERIC : ZL_GRAPH_LZ;
-    if (window_log) {
-        ZL_IntParam p = { ZL_LzParam_windowLog, window_log };
-        ZL_LocalParams local = { .intParams = { &p, 1 } };
-        ZL_ParameterizedGraphDesc desc = { .graph = graph, .localParams = &local };
-        graph = ZL_Compressor_registerParameterizedGraph(compressor, &desc);
-    }
     ZL_Report report = ZL_Compressor_selectStartingGraphID(compressor, graph);
     if (ZL_isError(report)) {
         zlpng_fail(ZL_Compressor_getErrorContextString(compressor, report));
@@ -110,6 +104,16 @@ size_t zlpng_backend_compress(int codec, int level, int window_log,
     if (ZL_isError(report)) {
         zlpng_fail(ZL_CCtx_getErrorContextString(ctx, report));
         goto cleanup;
+    }
+    if (window_log) {
+        ZL_IntParam p = { ZL_LzParam_windowLog, window_log };
+        ZL_LocalParams local = { .intParams = { &p, 1 } };
+        ZL_GraphParameters params = { .localParams = &local };
+        report = ZL_CCtx_selectStartingGraphID(ctx, NULL, graph, &params);
+        if (ZL_isError(report)) {
+            zlpng_fail(ZL_CCtx_getErrorContextString(ctx, report));
+            goto cleanup;
+        }
     }
     if (codec == ZLPNG_OPENZL_NUMERIC) {
         input = ZL_TypedRef_createNumeric(src, element_bytes, n / element_bytes);
@@ -131,8 +135,9 @@ cleanup:
     return result;
 }
 
-int zlpng_backend_inspect(const void* src, size_t n,
-                          size_t* decompressed_bytes, unsigned* element_bytes)
+static int zlpng_inspect(const void* src, size_t n,
+                         size_t* decompressed_bytes, unsigned* element_bytes,
+                         int check_frame_length)
 {
     zlpng_error[0] = '\0';
     if (decompressed_bytes) *decompressed_bytes = 0;
@@ -140,9 +145,11 @@ int zlpng_backend_inspect(const void* src, size_t n,
     if (!src || !n || !decompressed_bytes || !element_bytes)
         return (int)zlpng_fail("null or empty frame inspection argument");
 
-    const ZL_Report compressed = ZL_getCompressedSize(src, n);
-    if (ZL_isError(compressed) || ZL_validResult(compressed) != n)
-        return (int)zlpng_fail("invalid frame length, truncation or trailing data");
+    if (check_frame_length) {
+        const ZL_Report compressed = ZL_getCompressedSize(src, n);
+        if (ZL_isError(compressed) || ZL_validResult(compressed) != n)
+            return (int)zlpng_fail("invalid frame length, truncation or trailing data");
+    }
     ZL_FrameInfo* frame = ZL_FrameInfo_create(src, n);
     if (!frame) return (int)zlpng_fail("invalid OpenZL frame header");
     int result = 0;
@@ -191,6 +198,12 @@ cleanup:
     return result;
 }
 
+int zlpng_backend_inspect(const void* src, size_t n,
+                          size_t* decompressed_bytes, unsigned* element_bytes)
+{
+    return zlpng_inspect(src, n, decompressed_bytes, element_bytes, 1);
+}
+
 static size_t zlpng_decompress(int codec, unsigned expected_element,
                               const void* src, size_t n,
                               void* dst, size_t capacity)
@@ -200,7 +213,9 @@ static size_t zlpng_decompress(int codec, unsigned expected_element,
     if (!dst || !capacity) return zlpng_fail("null or empty output buffer");
     size_t expected = 0;
     unsigned element = 0;
-    if (!zlpng_backend_inspect(src, n, &expected, &element)) return 0;
+    /* The decoder itself rejects truncated frames and trailing bytes. Inspect
+     * only the header here, avoiding a redundant walk over every chunk. */
+    if (!zlpng_inspect(src, n, &expected, &element, 0)) return 0;
     if ((codec == ZLPNG_OPENZL_LZ && element != 1) ||
         (codec == ZLPNG_OPENZL_NUMERIC && element != 0))
         return zlpng_fail("frame type disagrees with the selected codec");

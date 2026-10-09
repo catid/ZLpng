@@ -1,312 +1,166 @@
-// ZLpng's native container around reversible image transforms and OpenZL.
+// MED + OpenZL. Independent horizontal bands permit parallel encode and decode.
 #include "zlpng.h"
-#ifndef ZPNG_FUSED8
-#define ZPNG_FUSED8
-#endif
-#include "internal/filter_runtime.hpp"
 #include "zlpng_backend.h"
+#include "internal/med_filter.hpp"
+#include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
-
-#include "zlpng_policy.hpp"
-
-using namespace zlpng_internal;
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace {
-using Allocation = std::unique_ptr<uint8_t, decltype(&std::free)>;
+using Allocation = std::unique_ptr<unsigned char, decltype(&std::free)>;
+constexpr size_t HeaderBytes = 12;
+constexpr size_t BandBytes = 256 * 1024;
 
-static bool big_endian_host() {
-    const uint16_t probe = 1;
-    return *reinterpret_cast<const uint8_t*>(&probe) == 0;
+void require(bool ok) { if (!ok) throw std::runtime_error("Invalid ZLpng input"); }
+Allocation allocate(size_t size) {
+    Allocation p(static_cast<unsigned char*>(std::malloc(size)), &std::free);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+unsigned read16(const unsigned char* p) { return unsigned(p[0]) | unsigned(p[1]) << 8; }
+unsigned read32(const unsigned char* p) { return read16(p) | read16(p + 2) << 16; }
+void write16(unsigned char* p, unsigned n) { p[0] = n; p[1] = n >> 8; }
+void write32(unsigned char* p, unsigned n) { write16(p, n); write16(p + 2, n >> 16); }
+size_t raw_size(unsigned w, unsigned h, unsigned c, unsigned b) {
+    require(w && h && w <= 65535 && h <= 65535 && c >= 1 && c <= 4 && (b == 1 || b == 2));
+    const uint64_t size = uint64_t(w) * h * c * b;
+    require(size <= UINT_MAX);
+    return size_t(size);
+}
+zlpng_med::Format format(unsigned w, unsigned h, unsigned c, unsigned b) {
+    return {w, h, c, b * 8};
+}
+void numeric_endian(unsigned char* p, size_t n, unsigned element) {
+    const uint16_t one = 1;
+    if (element == 2 && *reinterpret_cast<const unsigned char*>(&one) == 0)
+        for (size_t i = 0; i < n; i += 2) std::swap(p[i], p[i + 1]);
 }
 
-static void swap_sample_bytes(Bytes& bytes) {
-    require(bytes.size() % 2 == 0, "Odd 16-bit sample payload");
-    for (size_t i = 0; i < bytes.size(); i += 2) std::swap(bytes[i], bytes[i + 1]);
-}
-
-static size_t raw_size(unsigned w, unsigned h, unsigned channels, unsigned bytes) {
-    require(w && h && w <= 65535 && h <= 65535, "Invalid image dimensions");
-    require(channels >= 1 && channels <= 4 && (bytes == 1 || bytes == 2), "Invalid image format");
-    const uint64_t raw = uint64_t(w) * h * channels * bytes;
-    require(raw <= UINT_MAX, "Image exceeds buffer interface");
-    return size_t(raw);
-}
-
-static size_t validate_input(const ZLPNG_ImageData* source) {
-    require(source && source->Buffer.Data, "Missing image pixels");
-    const size_t raw = raw_size(source->WidthPixels, source->HeightPixels,
-                               source->Channels, source->BytesPerChannel);
-    const size_t row = size_t(source->WidthPixels) * source->Channels * source->BytesPerChannel;
-    require(source->StrideBytes >= row, "Short image stride");
-    require(uint64_t(source->HeightPixels - 1) * source->StrideBytes + row <= source->Buffer.Bytes,
-            "Short image buffer");
-    return raw;
-}
-
-static const ZLPNG_Policy& policy_for(unsigned channels, unsigned bits) {
-    for (const ZLPNG_Policy& policy : ZLPNG_POLICIES)
-        if (policy.channels == channels && policy.bits == bits) {
-            require(policy.count >= 1 && policy.count <= 8, "Invalid compression policy");
-            return policy;
-        }
-    throw std::runtime_error("Unsupported image format");
-}
-
-static void copy_pixels(Image& image, const ZLPNG_ImageData& source) {
-    const size_t row = size_t(image.w) * image.c * (image.bits / 8);
-    image.bytes.resize(row * image.h);
-    for (unsigned y = 0; y < image.h; ++y)
-        std::memcpy(image.bytes.data() + size_t(y) * row,
-                    source.Buffer.Data + size_t(y) * source.StrideBytes, row);
-}
-
-static Bytes transform(const Image& image, const R3Config& q, bool decode, const Bytes& input) {
-    if (r5_runs_supported(image, q)) return r5_runs(image, q, decode, input);
-    if (r5_triangular_supported(image, q)) return r5_triangular(image, q, decode, input);
-    if (r5_packing_supported(image, q)) return r5_packing(image, q, decode, input);
-    if (q.family >= 26 && q.family <= 30) return r5_blend(image, q, decode, input);
-    return r3_run(image, q, decode, input, true);
-}
-
-static Config sample_config(const Image& image, const std::string& method) {
-    Config q;
-    if (method == "sample_raw") return q;
-    q.layout = 1;
-    if (method == "sample_planar") return q;
-    if (method == "sample_med_none") { q.pred = 5; return q; }
-    q.color = image.c >= 3 ? 2 : 0;
-    if (method == "sample_med_green_planar") q.pred = 5;
-    else if (method == "sample_gradient_green_planar") q.pred = 6;
-    else if (method == "sample_left_green_planar") q.pred = 1;
-    else throw std::runtime_error("Unknown sample transform");
-    return q;
-}
-
-static Bytes legacy_header(const Image& image) {
-    Bytes out(8);
-    out[0] = 0xf8; out[1] = 0xfb;
-    out[2] = uint8_t(image.w); out[3] = uint8_t(image.w >> 8);
-    out[4] = uint8_t(image.h); out[5] = uint8_t(image.h >> 8);
-    out[6] = uint8_t(image.c); out[7] = uint8_t(image.bits / 8);
-    return out;
-}
-
-static void legacy_filter(const ZLPNG_ImageData& source, uint8_t* output) {
-    switch (source.Channels * source.BytesPerChannel) {
-#define ZLPNG_PIXEL(P) case P: r5_legacy_filter<P>(source, output); return
-        ZLPNG_PIXEL(1); ZLPNG_PIXEL(2); ZLPNG_PIXEL(3);
-        ZLPNG_PIXEL(4); ZLPNG_PIXEL(6); ZLPNG_PIXEL(8);
-#undef ZLPNG_PIXEL
-    }
-    throw std::runtime_error("Invalid pixel width");
-}
-
-template<unsigned Pixel>
-static void legacy_inverse(const uint8_t* input, uint8_t* output, const Image& image) {
-    const size_t plane = size_t(image.w) * image.h;
-    for (unsigned y = 0; y < image.h; ++y) {
-        uint8_t previous[Pixel] = {};
-        for (unsigned x = 0; x < image.w; ++x) {
-            const size_t i = size_t(y) * image.w + x;
-            if (Pixel == 3 || Pixel == 4) {
-                const uint8_t blue = input[i];
-                const uint8_t green = uint8_t(input[plane + i] + blue);
-                previous[0] += uint8_t(green - input[2 * plane + i]);
-                previous[1] += green; previous[2] += blue;
-                if (Pixel == 4) previous[3] += input[3 * plane + i];
-                for (unsigned c = 0; c < Pixel; ++c) output[i * Pixel + c] = previous[c];
-            } else {
-                for (unsigned c = 0; c < Pixel; ++c) {
-                    previous[c] += input[i * Pixel + c];
-                    output[i * Pixel + c] = previous[c];
-                }
+// Worker state is local to this call. Thread count never changes encoded bytes.
+template<class Function> void parallel(unsigned count, unsigned threads, const Function& fn) {
+    if (!threads) threads = std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+    threads = std::min({threads, count, 64u});
+    std::atomic<unsigned> next{0};
+    std::atomic<bool> failed{false};
+    const auto worker = [&] {
+        try {
+            for (;;) {
+                const unsigned i = next.fetch_add(1, std::memory_order_relaxed);
+                if (i >= count || failed.load(std::memory_order_relaxed)) break;
+                fn(i);
             }
-        }
+        } catch (...) { failed.store(true, std::memory_order_relaxed); }
+    };
+    std::vector<std::thread> workers;
+    workers.reserve(threads - 1);
+    for (unsigned i = 1; i < threads; ++i) {
+        try { workers.emplace_back(worker); }
+        catch (...) { break; } // Fall back to the workers already available.
     }
+    worker();
+    for (auto& thread : workers) thread.join();
+    require(!failed.load(std::memory_order_relaxed));
+}
+struct Band { size_t offset, bytes; };
 }
 
-static void legacy_unfilter(const uint8_t* input, uint8_t* output, const Image& image) {
-    switch (image.c * (image.bits / 8)) {
-#define ZLPNG_PIXEL(P) case P: legacy_inverse<P>(input, output, image); return
-        ZLPNG_PIXEL(1); ZLPNG_PIXEL(2); ZLPNG_PIXEL(3);
-        ZLPNG_PIXEL(4); ZLPNG_PIXEL(6); ZLPNG_PIXEL(8);
-#undef ZLPNG_PIXEL
-    }
-    throw std::runtime_error("Invalid pixel width");
-}
-
-static Bytes filtered_payload(Image& image, const std::string& method, Bytes& head) {
-    if (method.compare(0, 7, "sample_") == 0) {
-        const Config q = sample_config(image, method);
-        head = header(image, q); return run_filter(image, q);
-    }
-    if (method.compare(0, 3, "r3_") == 0) {
-        const R3Config q = r3_parse(method, image.bits);
-        Bytes payload = transform(image, q, false, image.bytes);
-        head = r3_header(image, q, payload.size()); return payload;
-    }
-    if (method.compare(0, 3, "r2_") == 0) {
-        const R2Config q = r2_parse(method, image.bits);
-        Bytes payload = r2_run(image, q, false, image.bytes, true);
-        head = r2_header(image, q, payload.size()); return payload;
-    }
-    const Config q = r3_old_config(method, image.bits);
-    head = header(image, q); return run_filter(image, q);
-}
-
-static ZLPNG_Buffer encode_member(const ZLPNG_ImageData& source, Image& image,
-                                  const ZLPNG_PolicyMember& member) {
-    require(member.codec == 1 || member.codec == 2, "ZLpng requires OpenZL");
-    const std::string method = member.method;
-    require(member.codec != 2 || method.compare(0, 7, "sample_") == 0,
-            "Numeric codec requires a sample transform");
-    Bytes head, payload;
-    Allocation packed(nullptr, &std::free);
-    const uint8_t* input = nullptr;
-    size_t size = 0;
-    if (method == "legacy_level1") {
-        size = size_t(image.w) * image.h * image.c * (image.bits / 8);
-        packed.reset(static_cast<uint8_t*>(std::malloc(size)));
-        if (!packed) throw std::bad_alloc();
-        legacy_filter(source, packed.get()); input = packed.get(); head = legacy_header(image);
-    } else {
-        if (image.bytes.empty()) copy_pixels(image, source);
-        payload = filtered_payload(image, method, head); input = payload.data(); size = payload.size();
-    }
-    const unsigned element = member.codec == 2 && method.compare(0, 7, "sample_") == 0 ? image.bits / 8 : 1;
-    // OpenZL numeric inputs use host endianness; image transform payloads use
-    // little-endian samples on every platform.
-    if (member.codec == 2 && element == 2 && big_endian_host()) {
-        swap_sample_bytes(payload); input = payload.data();
-    }
-    const size_t bound = zlpng_backend_bound(member.codec, size);
-    const size_t offset = 8 + head.size();
-    require(bound && bound <= UINT_MAX - offset, "Compressed allocation exceeds interface");
-    Allocation output(static_cast<uint8_t*>(std::malloc(offset + bound)), &std::free);
-    if (!output) throw std::bad_alloc();
-    std::memcpy(output.get(), "ZLP1", 4);
-    output.get()[4] = uint8_t(member.codec); output.get()[5] = uint8_t(element);
-    output.get()[6] = uint8_t(head.size()); output.get()[7] = uint8_t(head.size() >> 8);
-    std::memcpy(output.get() + 8, head.data(), head.size());
-    const size_t compressed = zlpng_backend_compress(member.codec, member.level, member.window,
-                                                  element, input, size, output.get() + offset, bound);
-    require(compressed && compressed <= bound, "OpenZL compression failed");
-    return {output.release(), unsigned(offset + compressed)};
-}
-
-static ZLPNG_ImageData decoded_image(const Image& shape, Allocation pixels, size_t raw) {
-    ZLPNG_ImageData out = {};
-    out.WidthPixels = shape.w; out.HeightPixels = shape.h;
-    out.Channels = shape.c; out.BytesPerChannel = shape.bits / 8;
-    out.StrideBytes = shape.w * shape.c * (shape.bits / 8);
-    out.Buffer = {pixels.release(), unsigned(raw)};
-    return out;
-}
-
-static ZLPNG_ImageData decode(ZLPNG_Buffer encoded, unsigned max_raw_bytes) {
-    require(encoded.Data && encoded.Bytes >= 17 && !std::memcmp(encoded.Data, "ZLP1", 4), "Invalid ZLpng stream");
-    const uint8_t* data = encoded.Data;
-    const unsigned codec = data[4], element = data[5];
-    const size_t hsize = unsigned(data[6]) | unsigned(data[7]) << 8;
-    require((codec == 1 && element == 1) || (codec == 2 && (element == 1 || element == 2)), "Invalid OpenZL input type");
-    require((hsize == 8 || hsize == 24 || hsize == 32 || hsize == 48) && 8 + hsize < encoded.Bytes,
-            "Invalid transform header length");
-    Bytes head(data + 8, data + 8 + hsize);
-    Image image;
-    if (hsize == 8) {
-        require(head[0] == 0xf8 && head[1] == 0xfb && codec == 1, "Invalid legacy transform header");
-        image.w = unsigned(head[2]) | unsigned(head[3]) << 8;
-        image.h = unsigned(head[4]) | unsigned(head[5]) << 8;
-        image.c = head[6]; image.bits = unsigned(head[7]) * 8;
-    } else {
-        const char* magic = hsize == 24 ? "ZPF1" : hsize == 32 ? "ZPF2" : "ZPF3";
-        require(!std::memcmp(head.data(), magic, 4), "Wrong transform header magic");
-        image.w = read32(head.data() + 4); image.h = read32(head.data() + 8);
-        image.c = head[12]; image.bits = head[13];
-    }
-    require(image.bits == 8 || image.bits == 16, "Invalid bit depth");
-    const size_t raw = raw_size(image.w, image.h, image.c, image.bits / 8);
-    require(raw <= max_raw_bytes, "Image exceeds decode limit");
-    size_t expected = raw;
-    R3Config q3; R2Config q2; Config q1;
-    if (hsize == 48) q3 = r3_read_header(head, image, expected);
-    else if (hsize == 32) {
-        require(head[19] == 0, "Invalid reserved header byte");
-        q2 = r2_read_header(head, image, expected);
-    } else if (hsize == 24) {
-        q1 = read_header(head, image);
-        require(head[22] == 0 && head[23] == 0 && (image.bits == 16 || !q1.split), "Invalid fixed transform flags");
-        const uint64_t length = uint64_t(raw) + selectors(image, q1);
-        require(length <= UINT_MAX && length <= std::numeric_limits<size_t>::max(),
-                "Fixed transform payload exceeds interface");
-        expected = size_t(length);
-    }
-    require(expected && expected <= UINT_MAX && expected <= uint64_t(raw) * 16 + 1048576,
-            "Invalid transform payload size");
-    if (codec == 2)
-        require(hsize == 24 && element == image.bits / 8 && !q1.adaptive && !q1.split,
-                "Numeric codec requires unsplit sample payload");
-    const uint8_t* frame = data + 8 + hsize;
-    const size_t compressed = encoded.Bytes - 8 - hsize;
-    size_t frame_output = 0; unsigned frame_element = 0;
-    require(zlpng_backend_inspect(frame, compressed, &frame_output, &frame_element) &&
-            frame_output == expected && frame_element == (codec == 1 ? 1 : 0),
-            "OpenZL frame metadata mismatch");
-
-    if (hsize == 8) {
-        Allocation packed(static_cast<uint8_t*>(std::malloc(raw)), &std::free);
-        Allocation pixels(static_cast<uint8_t*>(std::malloc(raw)), &std::free);
-        if (!packed || !pixels) throw std::bad_alloc();
-        require(zlpng_backend_decompress_typed(codec, element, frame, compressed, packed.get(), raw) == raw,
-                "OpenZL decompression failed");
-        legacy_unfilter(packed.get(), pixels.get(), image);
-        return decoded_image(image, std::move(pixels), raw);
-    }
-    Bytes payload(expected);
-    require(zlpng_backend_decompress_typed(codec, element, frame, compressed, payload.data(), payload.size()) == expected,
-            "OpenZL decompression failed");
-    if (codec == 2 && element == 2 && big_endian_host()) swap_sample_bytes(payload);
-    image.bytes.resize(raw, 0);
-    Bytes pixels = hsize == 48 ? transform(image, q3, true, payload) :
-                   hsize == 32 ? r2_run(image, q2, true, payload, true) : run_unfilter(payload, image, q1);
-    require(pixels.size() == raw, "Reconstructed image size mismatch");
-    Allocation output(static_cast<uint8_t*>(std::malloc(raw)), &std::free);
-    if (!output) throw std::bad_alloc();
-    std::memcpy(output.get(), pixels.data(), raw);
-    return decoded_image(image, std::move(output), raw);
-}
-} // namespace
-
-extern "C" ZLPNG_Buffer ZLPNG_Compress(const ZLPNG_ImageData* source, unsigned effort) {
+extern "C" ZLPNG_Buffer ZLPNG_CompressThreads(const ZLPNG_ImageData* image, unsigned effort, unsigned threads) {
     try {
-        require(effort >= 1 && effort <= 8, "Effort must be 1..8");
-        validate_input(source);
-        Image image; image.w = source->WidthPixels; image.h = source->HeightPixels;
-        image.c = source->Channels; image.bits = source->BytesPerChannel * 8;
-        const ZLPNG_Policy& policy = policy_for(image.c, image.bits);
-        Allocation best(nullptr, &std::free); unsigned best_size = 0;
-        for (unsigned i = 0; i < std::min(effort, policy.count); ++i) {
-            ZLPNG_Buffer encoded = encode_member(*source, image, policy.members[i]);
-            Allocation candidate(encoded.Data, &std::free);
-            if (!best || encoded.Bytes < best_size) {
-                best = std::move(candidate); best_size = encoded.Bytes;
-            }
+        require(image && image->Buffer.Data && effort >= 1 && effort <= 8);
+        const unsigned w = image->WidthPixels, h = image->HeightPixels;
+        const unsigned c = image->Channels, b = image->BytesPerChannel;
+        raw_size(w, h, c, b);
+        const size_t row = size_t(w) * c * b;
+        require(image->StrideBytes >= row && uint64_t(h - 1) * image->StrideBytes + row <= image->Buffer.Bytes);
+        const unsigned rows = unsigned(std::max(size_t(1), BandBytes / row));
+        const unsigned count = (h + rows - 1) / rows;
+        const int codec = effort >= 2 ? ZLPNG_OPENZL_NUMERIC : ZLPNG_OPENZL_LZ;
+        const unsigned element = codec == ZLPNG_OPENZL_NUMERIC ? b : 1;
+        std::vector<Band> bands(count);
+        size_t capacity = HeaderBytes;
+        for (unsigned i = 0; i < count; ++i) {
+            const size_t bound = zlpng_backend_bound(codec, std::min(rows, h - i * rows) * row);
+            require(bound && capacity + 4 + bound <= UINT_MAX);
+            bands[i] = {capacity, bound}; capacity += 4 + bound;
         }
-        return {best.release(), best_size};
+        auto output = allocate(capacity);
+        std::memcpy(output.get(), "ZLP2", 4);
+        write16(output.get() + 4, w); write16(output.get() + 6, h);
+        output.get()[8] = c; output.get()[9] = b;
+        output.get()[10] = codec; output.get()[11] = 0;
+        parallel(count, threads, [&](unsigned i) {
+            const unsigned y = i * rows, height = std::min(rows, h - y);
+            const size_t raw = height * row;
+            auto residuals = allocate(raw);
+            zlpng_med::encode(image->Buffer.Data + size_t(y) * image->StrideBytes,
+                image->StrideBytes, residuals.get(), format(w, height, c, b));
+            if (codec == ZLPNG_OPENZL_NUMERIC) numeric_endian(residuals.get(), raw, element);
+            Band& band = bands[i];
+            const size_t stored = zlpng_backend_compress(codec, effort == 1 ? 1 : int(effort - 1),
+                effort == 1 ? 16 : 0, element, residuals.get(), raw,
+                output.get() + band.offset + 4, band.bytes);
+            require(stored && stored <= band.bytes);
+            write32(output.get() + band.offset, unsigned(stored)); band.bytes = stored;
+        });
+        size_t stored = HeaderBytes;
+        for (const auto& band : bands) {
+            std::memmove(output.get() + stored, output.get() + band.offset, band.bytes + 4);
+            stored += band.bytes + 4;
+        }
+        return {output.release(), unsigned(stored)};
     } catch (...) { return {}; }
 }
 
-extern "C" ZLPNG_ImageData ZLPNG_DecompressWithLimit(ZLPNG_Buffer encoded, unsigned max_raw_bytes) {
-    try { return decode(encoded, max_raw_bytes); }
-    catch (...) { return {}; }
+extern "C" ZLPNG_ImageData ZLPNG_DecompressThreadsWithLimit(ZLPNG_Buffer encoded, unsigned max_raw_bytes, unsigned threads) {
+    try {
+        require(encoded.Data && encoded.Bytes > HeaderBytes && !std::memcmp(encoded.Data, "ZLP2", 4));
+        const unsigned char* p = encoded.Data;
+        const unsigned w = read16(p + 4), h = read16(p + 6), c = p[8], b = p[9];
+        const int codec = p[10];
+        require((codec == ZLPNG_OPENZL_LZ || codec == ZLPNG_OPENZL_NUMERIC) && p[11] == 0);
+        const size_t raw = raw_size(w, h, c, b), row = size_t(w) * c * b;
+        require(raw <= max_raw_bytes);
+        const unsigned rows = unsigned(std::max(size_t(1), BandBytes / row));
+        const unsigned count = (h + rows - 1) / rows;
+        std::vector<Band> bands(count);
+        size_t offset = HeaderBytes;
+        for (auto& band : bands) {
+            require(offset + 4 <= encoded.Bytes);
+            const unsigned n = read32(p + offset); offset += 4;
+            require(n && n <= encoded.Bytes - offset);
+            band = {offset, n}; offset += n;
+        }
+        require(offset == encoded.Bytes);
+        auto pixels = allocate(raw);
+        parallel(count, threads, [&](unsigned i) {
+            const unsigned y = i * rows, height = std::min(rows, h - y);
+            const size_t size = height * row;
+            auto residuals = allocate(size);
+            const unsigned element = codec == ZLPNG_OPENZL_NUMERIC ? b : 1;
+            const Band& band = bands[i];
+            require(zlpng_backend_decompress_typed(codec, element, p + band.offset, band.bytes,
+                residuals.get(), size) == size);
+            if (codec == ZLPNG_OPENZL_NUMERIC) numeric_endian(residuals.get(), size, element);
+            zlpng_med::decode(residuals.get(), pixels.get() + size_t(y) * row, row, format(w, height, c, b));
+        });
+        return {{pixels.release(), unsigned(raw)}, b, c, w, h, unsigned(row)};
+    } catch (...) { return {}; }
 }
-
+extern "C" ZLPNG_Buffer ZLPNG_Compress(const ZLPNG_ImageData* image, unsigned effort) {
+    return ZLPNG_CompressThreads(image, effort, 0);
+}
+extern "C" ZLPNG_ImageData ZLPNG_DecompressWithLimit(ZLPNG_Buffer encoded, unsigned max_raw_bytes) {
+    return ZLPNG_DecompressThreadsWithLimit(encoded, max_raw_bytes, 0);
+}
 extern "C" ZLPNG_ImageData ZLPNG_Decompress(ZLPNG_Buffer encoded) {
     return ZLPNG_DecompressWithLimit(encoded, UINT_MAX);
 }
-
 extern "C" void ZLPNG_Free(ZLPNG_Buffer* buffer) {
-    if (buffer) { std::free(buffer->Data); buffer->Data = nullptr; buffer->Bytes = 0; }
+    if (buffer) { std::free(buffer->Data); *buffer = {}; }
 }

@@ -1,85 +1,80 @@
-# ZLpng format and API
+# Format and API
 
-ZLpng stores exact image samples in a self-contained `ZLP1` container. It uses
-OpenZL 0.3.0, frame format 27. It does not decode original ZPNG files.
-
-The C API is declared in [`zlpng.h`](../zlpng.h). A `ZLPNG_ImageData` describes
-1–4 channels, 8-bit or little-endian 16-bit samples, dimensions 1–65535, and
-row stride. The buffer must cover the last packed row. Row padding is omitted
-from the file; all sample bits, alpha, and hidden RGB values are preserved.
-Buffers use unsigned 32-bit lengths, limiting a single image to less than
-4 GiB. Compression can also fail when the compressed allocation exceeds that
-interface.
+ZLpng stores exact 1–4 channel images with 8-bit or little-endian 16-bit
+samples. Dimensions are 1–65535; buffers use unsigned 32-bit lengths.
+Alpha and hidden RGB are preserved. Image-file metadata is outside this API.
 
 ```c
 #include "zlpng.h"
 
-/* Fill image.Buffer, dimensions, channel depth, and stride first. */
-ZLPNG_Buffer file = ZLPNG_Compress(&image, 4);
+ZLPNG_Buffer file = ZLPNG_Compress(&image, 1);
 if (file.Data) {
     ZLPNG_ImageData restored = ZLPNG_Decompress(file);
-    /* A non-null restored.Buffer.Data indicates success. */
+    /* restored.Buffer.Data is non-null on success. */
     ZLPNG_Free(&restored.Buffer);
     ZLPNG_Free(&file);
 }
 ```
 
-Effort must be 1–8. The CLI defaults to 1; the API takes an explicit effort.
-An encoder tries the first *k* entries in its format's ordered list, capped
-by that list's length. The first smallest complete file wins. Decoding does
-not depend on the encoder's list or effort. Increasing effort cannot enlarge
-a file, but there is no size bound relative to the separate ZPNG format.
+Input rows may include padding; output rows are packed. Failures return
+an all-zero buffer/image. Input stays caller-owned; release output with
+`ZLPNG_Free`. Calls are thread-safe. Ordinary calls use up to eight workers;
+`ZLPNG_CompressThreads` and `ZLPNG_DecompressThreadsWithLimit` accept an
+explicit worker limit (0 = automatic, 1 = serial, maximum 64).
+Thread count never changes file contents.
 
-Failures return a zero buffer or image. `ZLPNG_Free` resets the released
-buffer and accepts a null pointer. Input remains caller-owned. Calls use
-independent contexts and can run concurrently.
+`ZLPNG_DecompressWithLimit(file, max_raw_bytes)` rejects larger images before
+allocating pixels. The limit bounds output size, not total scratch memory.
 
-`ZLPNG_DecompressWithLimit(file, max_raw_bytes)` rejects a larger declared
-image before allocating pixel storage. This bounds the returned image, not
-all temporary decoder memory. The ordinary decoder uses `UINT_MAX` as its
-limit.
+Effort 1–8 changes only OpenZL's backend settings:
 
-## Container
+| Effort | OpenZL graph | Level | Window |
+| ---: | --- | ---: | --- |
+| 1 | Native LZ | 1 | 64 KiB |
+| 2 | Numeric | 1 | Default |
+| 3 | Numeric | 2 | Default |
+| 4 | Numeric | 3 | Default |
+| 5 | Numeric | 4 | Default |
+| 6 | Numeric | 5 | Default |
+| 7 | Numeric | 6 | Default |
+| 8 | Numeric | 7 | Default |
 
-All image metadata is little-endian.
+Every effort uses the same predictor and one backend pass. Higher effort
+can occasionally produce a larger file. Decoding needs no effort setting.
+
+## ZLP2 container
+
+All metadata integers are little-endian.
 
 | Offset | Bytes | Meaning |
 | ---: | ---: | --- |
-| 0 | 4 | `ZLP1` magic |
-| 4 | 1 | OpenZL input type: 1 = serial LZ, 2 = numeric |
-| 5 | 1 | Sample width: 1 for serial, 1 or 2 for numeric |
-| 6 | 2 | Transform metadata size: 8, 24, 32, or 48 |
-| 8 | variable | Geometry and complete reversible-transform description |
-| following | remainder | Exactly one OpenZL frame |
+| 0 | 4 | `ZLP2` magic |
+| 4 | 2 | Width |
+| 6 | 2 | Height |
+| 8 | 1 | Channels, 1–4 |
+| 9 | 1 | Bytes per sample, 1 or 2 |
+| 10 | 1 | OpenZL graph: 1 = serial LZ, 2 = numeric |
+| 11 | 1 | Reserved, zero |
+| 12 | variable | Consecutive bands: uint32 frame length, then one OpenZL frame |
 
-Transform metadata uses the existing tested binary layouts for the fast
-left/color transform (8 bytes), fixed/adaptive predictors (24), sample
-representations (32), and compound filters (48). These metadata layouts do
-not imply that a ZPNG/ZPF decoder can read the OpenZL payload. The parsing
-and inverse-transform implementation is in
-[`internal/filter_runtime.hpp`](../internal/filter_runtime.hpp).
+A band contains `max(1, floor(262144 / row_bytes))` complete rows, except
+the final shorter band. Each band resets the predictor and stores planar
+residuals. Eight-bit RGB(A) first becomes `(G, R-G, B-G[, A])`, with modular
+arithmetic; other sample formats keep their channels unchanged. Missing
+neighbors are zero. The MED prediction is `median(L, U, L+U-UL)` and the
+residual is `sample-prediction`, modulo the sample range.
 
-The decoder checks geometry, reserved fields, transform parameters, declared
-payload size, OpenZL output size/type, numeric sample width, and exact frame
-length. Trailing data and concatenated frames are rejected. Numeric samples
-are converted between the format's little-endian bytes and host order at
-the OpenZL boundary. Optional OpenZL checksums are disabled, as in the
-benchmarks; the format provides no content integrity checksum.
+OpenZL 0.3.0 uses frame format 27. Numeric frames retain sample widths;
+serial frames contain little-endian residual bytes. The implementation
+converts numeric data to/from host endianness. The decoder validates shape,
+reserved fields, band/frame lengths, output type/width/size and exact input
+consumption. Trailing bytes are rejected. Checksums are disabled.
+
+ZLP2 is incompatible with original ZPNG and earlier experimental ZLP1 files.
 
 ## ZRAW interchange
 
-The command-line tool accepts `.zraw` to preserve all supported sample
-formats without an image loader changing depth or channels:
-
-| Offset | Bytes | Meaning |
-| ---: | ---: | --- |
-| 0 | 4 | `ZRAW` magic |
-| 4 | 4 | Width |
-| 8 | 4 | Height |
-| 12 | 4 | Channels, 1–4 |
-| 16 | 4 | Bits per channel, 8 or 16 |
-| 20 | remainder | Packed row-major interleaved samples |
-
-All integers and 16-bit samples are little-endian. The payload must match
-the geometry exactly. ZLpng preserves sample data; image-file metadata such
-as EXIF and ICC profiles is outside this interface.
+The CLI reads/writes exact samples using a 20-byte header:
+`ZRAW`, then four little-endian uint32 values: width, height, channels,
+bits per channel. The remainder is packed, row-major, interleaved samples;
+16-bit samples are little-endian. The payload must match the shape exactly.

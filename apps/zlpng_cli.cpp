@@ -45,22 +45,27 @@ struct ImageOwner { ZLPNG_ImageData value = {}; ~ImageOwner() { ZLPNG_Free(&valu
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "Usage:\n  zlpng compress INPUT.zraw OUTPUT.zlp [--effort 1..8]\n"
-                         "  zlpng decompress INPUT.zlp OUTPUT.zraw\n"
+            std::cout << "Usage:\n  zlpng compress INPUT.zraw OUTPUT.zlp [--effort 1..8] [--threads N]\n"
+                         "  zlpng decompress INPUT.zlp OUTPUT.zraw [--threads N]\n"
                          "Effort defaults to 1. ZRAW preserves 1..4 channels and 8/16-bit samples.\n";
             return 0;
         }
-        check(argc == 4 || argc == 6, "Use --help for command syntax");
+        check(argc >= 4 && argc <= 8 && argc % 2 == 0, "Use --help for command syntax");
         const std::string command = argv[1];
         Bytes input = read_file(argv[2]);
+        unsigned effort = 1, threads = 0;
+        for (int i = 4; i < argc; i += 2) {
+            const std::string key = argv[i], value = argv[i + 1];
+            check(!value.empty() && value.find_first_not_of("0123456789") == std::string::npos,
+                  "Options require nonnegative integers");
+            const unsigned long n = std::stoul(value);
+            check(n <= UINT_MAX, "Option is too large");
+            if (key == "--effort" && command == "compress") effort = unsigned(n);
+            else if (key == "--threads") threads = unsigned(n);
+            else throw std::runtime_error("Unknown option");
+        }
         if (command == "compress") {
-            unsigned effort = 1;
-            if (argc == 6) {
-                check(std::string(argv[4]) == "--effort", "Unknown compression option");
-                const std::string text = argv[5];
-                check(text.size() == 1 && text[0] >= '1' && text[0] <= '8', "Effort must be 1..8");
-                effort = unsigned(text[0] - '0');
-            }
+            check(effort >= 1 && effort <= 8, "Effort must be 1..8");
             check(input.size() >= 20 && !std::memcmp(input.data(), "ZRAW", 4), "Invalid ZRAW header");
             ZLPNG_ImageData image = {};
             image.WidthPixels = read32(input.data() + 4); image.HeightPixels = read32(input.data() + 8);
@@ -76,14 +81,13 @@ int main(int argc, char** argv) {
                   "ZRAW dimensions do not match payload");
             image.StrideBytes = unsigned(row);
             image.Buffer = {input.data() + 20, unsigned(input.size() - 20)};
-            BufferOwner output; output.value = ZLPNG_Compress(&image, effort);
+            BufferOwner output; output.value = ZLPNG_CompressThreads(&image, effort, threads);
             check(output.value.Data != nullptr, "Image compression failed");
             write_file(argv[3], output.value.Data, output.value.Bytes);
             std::cout << image.Buffer.Bytes << " raw bytes -> " << output.value.Bytes << " bytes\n";
         } else if (command == "decompress") {
-            check(argc == 4, "Decompression takes no effort parameter");
             ZLPNG_Buffer encoded = {input.data(), unsigned(input.size())};
-            ImageOwner image; image.value = ZLPNG_Decompress(encoded);
+            ImageOwner image; image.value = ZLPNG_DecompressThreadsWithLimit(encoded, UINT_MAX, threads);
             check(image.value.Buffer.Data != nullptr, "Image decompression failed");
             Bytes output(20 + size_t(image.value.Buffer.Bytes));
             std::memcpy(output.data(), "ZRAW", 4);

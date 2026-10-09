@@ -12,7 +12,7 @@ compression and decompression. Every compression effort uses the same filter.
 For a sample $X$, let $L$, $U$, and $UL$ be its left, upper, and upper-left
 neighbors. The predictor follows local edges without overshooting:
 
-$$P = \operatorname{median}(L,\ U,\ L+U-UL)$$
+$$P = \mathrm{median}(L,\ U,\ L+U-UL)$$
 
 $$r = (X-P) \bmod 2^b \qquad X = (r+P) \bmod 2^b$$
 

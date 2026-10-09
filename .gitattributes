@@ -1,0 +1,7 @@
+# Preserve the exact bytes used by experiment provenance and checksums.
+/experiments/** -text
+/experiments/**/*.csv whitespace=cr-at-eol
+/experiments/**/*.tsv whitespace=cr-at-eol
+/experiments/**/*.log -whitespace
+/experiments/**/*.svg -whitespace
+/experiments/round3/results/build_final_commands.txt -whitespace
